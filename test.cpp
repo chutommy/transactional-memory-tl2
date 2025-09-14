@@ -58,6 +58,18 @@ struct Tx {
     if (!tm_write(tm, id, source, size, target))
       throw Abort{};
   }
+  void *alloc(size_t size) {
+    void *segment = nullptr;
+    Alloc result = tm_alloc(tm, id, size, &segment);
+    if (result == Alloc::abort)
+      throw Abort{};
+    CHECK(result == Alloc::success);
+    return segment;
+  }
+  void free(void *segment) {
+    if (!tm_free(tm, id, segment))
+      throw Abort{};
+  }
 
   // single word shortcuts
   word_t get(void *address) {
@@ -155,6 +167,36 @@ static void test_multiple_regions() {
 
 /**
  * =============================================================================
+ * Single-threaded: many segments can be allocated, start zeroed, are
+ * independent from each other and can be freed.
+ **/
+static void test_many_segments() {
+  constexpr size_t SEGMENTS = 1024;
+  shared_t tm = tm_create(WORD, WORD);
+  CHECK(tm != invalid_shared);
+  std::vector<void *> segments(SEGMENTS);
+
+  for (size_t i = 0; i < SEGMENTS; ++i)
+    atomically(tm, false, [&](Tx &tx) {
+      segments[i] = tx.alloc(2 * WORD);
+      tx.set(segments[i], i);
+    });
+  for (size_t i = 0; i < SEGMENTS; ++i) {
+    word_t written, untouched;
+    atomically(tm, true, [&](Tx &tx) {
+      written = tx.get(segments[i]);
+      untouched = tx.get(at(segments[i], WORD));
+    });
+    CHECK(written == static_cast<word_t>(i));
+    CHECK(untouched == 0);
+  }
+  for (size_t i = 0; i < SEGMENTS; ++i)
+    atomically(tm, false, [&](Tx &tx) { tx.free(segments[i]); });
+  tm_destroy(tm);
+}
+
+/**
+ * =============================================================================
  * Entry point: run every test, stop at the first failure.
  **/
 static void run(const char *name, void (*test)()) {
@@ -167,5 +209,6 @@ static void run(const char *name, void (*test)()) {
 int main() {
   run("read/write", test_read_write);
   run("multiple regions", test_multiple_regions);
+  run("many segments", test_many_segments);
   return 0;
 }
