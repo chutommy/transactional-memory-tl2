@@ -5,14 +5,19 @@
  * @section DESCRIPTION
  *
  * Test suite of the transactional memory.
+ * Single-threaded tests check the interface (read, write, alloc, free), then
+ * concurrent tests check that transactions are atomic and isolated.
  **/
 
 #include "tm.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 /**
@@ -95,6 +100,26 @@ static void atomically(shared_t tm, bool is_ro, Body &&body) {
     if (tm_end(tm, tx.id))
       return;
   }
+}
+
+/** Run 'work(thread index)' in 'count' threads released at the same time.
+ **/
+template <class Work> static void parallel(size_t count, Work &&work) {
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  for (size_t index = 0; index < count; ++index)
+    threads.emplace_back([&, index] {
+      while (!go.load())
+        std::this_thread::yield();
+      work(index);
+    });
+  go.store(true);
+  for (std::thread &thread : threads)
+    thread.join();
+}
+
+static size_t thread_count() {
+  return std::max(2u, std::thread::hardware_concurrency());
 }
 
 /**
@@ -197,6 +222,39 @@ static void test_many_segments() {
 
 /**
  * =============================================================================
+ * Concurrent: every thread repeatedly reads a shared counter in a read-only
+ * transaction, then decrements it in a read-write transaction.
+ * The counter must never go up between the two (isolation), and must end at
+ * exactly 0 (no lost update).
+ **/
+static void test_counter() {
+  constexpr size_t ROUNDS = 10000;
+  const size_t threads = thread_count();
+  shared_t tm = tm_create(WORD, WORD);
+  CHECK(tm != invalid_shared);
+  void *counter = tm_start(tm);
+  atomically(tm, false, [&](Tx &tx) { tx.set(counter, threads * ROUNDS); });
+
+  parallel(threads, [&](size_t) {
+    for (size_t round = 0; round < ROUNDS; ++round) {
+      word_t before, value;
+      atomically(tm, true, [&](Tx &tx) { before = tx.get(counter); });
+      atomically(tm, false, [&](Tx &tx) {
+        value = tx.get(counter);
+        tx.set(counter, value - 1);
+      });
+      CHECK(value <= before);
+    }
+  });
+
+  word_t left;
+  atomically(tm, true, [&](Tx &tx) { left = tx.get(counter); });
+  CHECK(left == 0);
+  tm_destroy(tm);
+}
+
+/**
+ * =============================================================================
  * Entry point: run every test, stop at the first failure.
  **/
 static void run(const char *name, void (*test)()) {
@@ -210,5 +268,6 @@ int main() {
   run("read/write", test_read_write);
   run("multiple regions", test_multiple_regions);
   run("many segments", test_many_segments);
+  run("counter", test_counter);
   return 0;
 }
