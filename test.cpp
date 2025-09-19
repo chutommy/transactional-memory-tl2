@@ -255,6 +255,160 @@ static void test_counter() {
 
 /**
  * =============================================================================
+ * Concurrent: a bank, whose accounts live in a linked list of segments.
+ * Segment layout:  +-------+------+--------+-----------+-----+-----------+
+ *                  | count | next | parity | balance 0 | ... | balance N |
+ *                  +-------+------+--------+-----------+-----+-----------+
+ * Every thread runs a random mix of transactions:
+ *   - audit    (read-only)  : sum all the balances
+ *   - transfer (read-write) : move one unit between two accounts
+ *   - resize   (read-write) : open or close the last account, which allocates
+ *                             or frees a segment when crossing its boundary
+ * Closing an account moves what it holds beyond the initial balance to the
+ * 'parity' of its segment, so that every audit must observe:
+ *   sum(balances) + sum(parities) == initial balance * number of accounts
+ **/
+static void test_bank() {
+  enum : size_t { COUNT, NEXT, PARITY, BALANCES };
+  const size_t threads = thread_count();
+  const size_t tx_per_thread = 200000 / threads;
+  const size_t capacity = 16 * threads; // accounts per segment
+  const size_t target = 4 * capacity;   // accounts the bank grows to
+  const word_t initial = 100;           // balance of a new account
+  const size_t segment_size = (BALANCES + capacity) * WORD;
+
+  shared_t tm = tm_create(segment_size, WORD);
+  CHECK(tm != invalid_shared);
+  void *first = tm_start(tm);
+
+  auto field = [](void *segment, size_t index) {
+    return at(segment, index * WORD);
+  };
+  auto next_of = [&](Tx &tx, void *segment) {
+    return reinterpret_cast<void *>(tx.get(field(segment, NEXT)));
+  };
+
+  atomically(tm, false, [&](Tx &tx) {
+    tx.set(field(first, COUNT), capacity);
+    for (size_t i = 0; i < capacity; ++i)
+      tx.set(field(first, BALANCES + i), initial);
+  });
+
+  // check the invariant, return the number of accounts
+  auto audit = [&]() {
+    size_t accounts;
+    bool consistent;
+    atomically(tm, true, [&](Tx &tx) {
+      word_t sum = 0;
+      accounts = 0;
+      consistent = true;
+      for (void *segment = first; segment; segment = next_of(tx, segment)) {
+        size_t count = tx.get(field(segment, COUNT));
+        sum += tx.get(field(segment, PARITY));
+        for (size_t i = 0; i < count; ++i) {
+          word_t balance = tx.get(field(segment, BALANCES + i));
+          consistent &= balance >= 0;
+          sum += balance;
+        }
+        accounts += count;
+      }
+      consistent &= sum == initial * static_cast<word_t>(accounts);
+    });
+    CHECK(consistent);
+    return accounts;
+  };
+
+  // address of the balance of the index-th account, nullptr if none
+  auto account = [&](Tx &tx, size_t index) -> void * {
+    for (void *segment = first; segment; segment = next_of(tx, segment)) {
+      size_t count = tx.get(field(segment, COUNT));
+      if (index < count)
+        return field(segment, BALANCES + index);
+      index -= count;
+    }
+    return nullptr;
+  };
+
+  // move one unit between two accounts, return whether both exist
+  auto transfer = [&](size_t from, size_t to) {
+    bool found;
+    atomically(tm, false, [&](Tx &tx) {
+      void *source = account(tx, from);
+      void *target = account(tx, to);
+      found = source && target;
+      if (!found)
+        return;
+      word_t balance = tx.get(source);
+      if (balance > 0) {
+        tx.set(source, balance - 1);
+        tx.set(target, tx.get(target) + 1);
+      }
+    });
+    return found;
+  };
+
+  // close the last account if there are more than 'limit', else open one
+  auto resize = [&](size_t limit) {
+    atomically(tm, false, [&](Tx &tx) {
+      void *previous = nullptr, *last = first;
+      size_t total = 0, count;
+      while (true) {
+        count = tx.get(field(last, COUNT));
+        total += count;
+        void *next = next_of(tx, last);
+        if (!next)
+          break;
+        previous = last;
+        last = next;
+      }
+      if (total > limit && total > 2) {
+        word_t parity = tx.get(field(last, PARITY)) +
+                        tx.get(field(last, BALANCES + count - 1)) - initial;
+        if (count > 1) {
+          tx.set(field(last, COUNT), count - 1);
+          tx.set(field(last, PARITY), parity);
+        } else { // the last segment gets empty: unlink and free it
+          word_t previous_parity = tx.get(field(previous, PARITY));
+          tx.set(field(previous, PARITY), previous_parity + parity);
+          tx.set(field(previous, NEXT), 0);
+          tx.free(last);
+        }
+      } else if (count < capacity) {
+        tx.set(field(last, BALANCES + count), initial);
+        tx.set(field(last, COUNT), count + 1);
+      } else { // the last segment is full: link a new one
+        void *segment = tx.alloc(segment_size);
+        tx.set(field(segment, COUNT), 1);
+        tx.set(field(segment, BALANCES), initial);
+        tx.set(field(last, NEXT), reinterpret_cast<word_t>(segment));
+      }
+    });
+  };
+
+  parallel(threads, [&](size_t index) {
+    std::minstd_rand rng(index + 1);
+    std::bernoulli_distribution is_audit(0.5), is_resize(0.02);
+    std::gamma_distribution<float> limit(target, 1);
+    size_t accounts = capacity; // refreshed by each audit
+    for (size_t i = 0; i < tx_per_thread; ++i) {
+      if (is_audit(rng)) {
+        accounts = audit();
+      } else if (is_resize(rng)) {
+        resize(limit(rng));
+      } else {
+        std::uniform_int_distribution<size_t> pick(0, accounts - 1);
+        while (!transfer(pick(rng), pick(rng)))
+          ;
+      }
+    }
+  });
+
+  audit();
+  tm_destroy(tm);
+}
+
+/**
+ * =============================================================================
  * Entry point: run every test, stop at the first failure.
  **/
 static void run(const char *name, void (*test)()) {
@@ -269,5 +423,6 @@ int main() {
   run("multiple regions", test_multiple_regions);
   run("many segments", test_many_segments);
   run("counter", test_counter);
+  run("bank", test_bank);
   return 0;
 }
