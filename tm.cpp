@@ -277,6 +277,77 @@ struct Region {
 
 /**
  * =============================================================================
+ * Transaction context.
+ * Contains read set, write set, write buffer, versions.
+ * Memory layout:  +---------------+--------------+--
+ *                 | read only bit : read version | ...
+ *                 +---------------+--------------+--
+ *               --+---------------+--------------+--------------------+--
+ *             ... | read set      , write set    , write buffer       | ...
+ *               --+---------------+--------------+--------------------+--
+ *                               --+--------------+--------------------+
+ *                             ... | allocated    / freed segments     |
+ *                               --+--------------+--------------------+
+ * ReadLog: contains the versioned lock of the read word.
+ * WriteLog: contains the versioned lock, target address, and offset in wbuffer.
+ * Write buffer: contiguous buffer for all write data.
+ * Allocated / freed segments: list of segment ids allocated / freed in tx.
+ **/
+struct Transaction {
+  using ReadLog = VL *;
+  struct WriteLog {
+    VL *vl;
+    void *addr;
+    uint64_t offset;
+  };
+
+  alignas(cache_line_size) bool read_only;
+  uint32_t read_version;
+  std::vector<ReadLog> read_set;
+  std::vector<WriteLog> write_set;
+  std::vector<char> write_buffer;
+  std::vector<uint32_t> allocated_segments;
+  std::vector<uint32_t> freed_segments;
+
+  Transaction() : read_only(false), read_version(0) {
+    read_set.reserve(256);
+    write_set.reserve(64);
+    write_buffer.reserve(1024);
+    allocated_segments.reserve(8);
+    freed_segments.reserve(8);
+  }
+  Transaction(Transaction const &) = delete;
+  Transaction &operator=(Transaction const &) = delete;
+
+  void reset(bool is_ro, uint32_t rv) {
+    read_only = is_ro;
+    read_version = rv;
+    read_set.clear();
+    write_set.clear();
+    write_buffer.clear();
+    allocated_segments.clear();
+    freed_segments.clear();
+  }
+};
+
+using TX = Transaction;
+
+/**
+ * =============================================================================
+ * End of a transaction.
+ **/
+// abort: the segments it allocated were never visible to other transactions.
+static bool abort_tx(Region *region, TX *tx) {
+  for (uint32_t si : tx->allocated_segments)
+    region->remove_segment(si);
+  tx->allocated_segments.clear();
+  return false;
+}
+// commit: for now, the segments it freed are only deleted with the region.
+static bool commit_tx(Region *unused(region), TX *unused(tx)) { return true; }
+
+/**
+ * =============================================================================
  * Interface, documented in tm.hpp.
  * tm_create: build the region and its first segment (segment 0).
  **/
@@ -318,4 +389,238 @@ size_t tm_size(shared_t shared) noexcept {
  **/
 size_t tm_align(shared_t shared) noexcept {
   return static_cast<Region *>(shared)->align;
+}
+
+/**
+ * =============================================================================
+ * tm_begin: reuse the context of the thread and sample the read version.
+ **/
+tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
+  Region *region = static_cast<Region *>(shared);
+  static thread_local TX tx; // no nested transactions
+  try {
+    uint32_t rv = region->global_version.load();
+    tx.reset(is_ro, rv);
+    return reinterpret_cast<tx_t>(&tx);
+  } catch (...) {
+    return invalid_tx;
+  }
+}
+
+/**
+ * =============================================================================
+ * tm_end: commit, i.e. lock the write set, take a write version, validate the
+ *         read set, write back and unlock.
+ **/
+bool _tm_end(shared_t shared, tx_t _tx) {
+  Region *region = static_cast<Region *>(shared);
+  TX *tx = reinterpret_cast<TX *>(_tx);
+  if (tx->read_only || tx->write_set.empty()) {
+    // yay, shortcut to glory
+    return commit_tx(region, tx);
+  }
+  std::sort(/* sort locks by address to prevent deadlock */
+            /* then by time of write, the last write to a word must win */
+            tx->write_set.begin(), tx->write_set.end(),
+            [](const TX::WriteLog &a, const TX::WriteLog &b) {
+              return a.vl != b.vl ? a.vl < b.vl : a.offset < b.offset;
+            });
+  // acquire all write locks
+  VL *prev_lock = nullptr;
+  for (const TX::WriteLog &wl : tx->write_set) {
+    if (wl.vl == prev_lock)
+      continue; // skip duplicate locks
+    wl.vl->lock();
+    prev_lock = wl.vl;
+  }
+  // increment global version
+  uint32_t write_version = region->global_version.fetch_add(1) + 1;
+  // validate read set
+  for (const VL *rl : tx->read_set) {
+    uint32_t snap = rl->vl.load(std::memory_order_acquire);
+    bool locked_by_me = false;
+    if (VL::is_locked(snap)) {
+      // is it in my write set?
+      auto it = std::lower_bound(
+          tx->write_set.begin(), tx->write_set.end(), rl,
+          [](const TX::WriteLog &wl, const VL *val) { return wl.vl < val; });
+      if (it != tx->write_set.end() && it->vl == rl)
+        locked_by_me = true;
+    }
+    if (unlikely((!locked_by_me && VL::is_locked(snap)) ||
+                 VL::version_of(snap) > tx->read_version)) {
+      // vl being modified, or is outdated
+      // release all locks in write set and abort
+      prev_lock = nullptr;
+      for (const TX::WriteLog &wl : tx->write_set) {
+        if (wl.vl == prev_lock)
+          continue;
+        wl.vl->unlock();
+        prev_lock = wl.vl;
+      }
+      return abort_tx(region, tx);
+    }
+  }
+  // commit writes
+  for (const TX::WriteLog &wl : tx->write_set)
+    std::memcpy(wl.addr, tx->write_buffer.data() + wl.offset, region->align);
+  prev_lock = nullptr;
+  for (const TX::WriteLog &wl : tx->write_set) {
+    if (wl.vl == prev_lock)
+      continue;
+    wl.vl->unlock_and_set(write_version);
+    prev_lock = wl.vl;
+  }
+  return commit_tx(region, tx);
+}
+bool tm_end(shared_t shared, tx_t _tx) noexcept {
+  try {
+    return _tm_end(shared, _tx);
+  } catch (...) {
+    return false;
+  }
+}
+
+/**
+ * =============================================================================
+ * Read of a single word (helper of tm_read).
+ **/
+// from the write set if the transaction wrote the word, else from shared
+// memory: fails if it is locked, newer than the read version, or modified
+// during the copy (lock sampled before and after).
+inline bool read_word(Region &region, TX &tx, VL *source_lock, const void *from,
+                      void *to) {
+  if (!tx.write_set.empty()) {
+    for (auto it = tx.write_set.rbegin(); it != tx.write_set.rend(); ++it) {
+      if (it->addr == from) {
+        std::memcpy(to, tx.write_buffer.data() + it->offset, region.align);
+        return true;
+      }
+    }
+  }
+  // read from shared memory
+  uint32_t snap = source_lock->vl.load(std::memory_order_acquire);
+  if (unlikely(VL::is_locked(snap) || VL::version_of(snap) > tx.read_version))
+    return false;
+  std::memcpy(to, from, region.align);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (unlikely(snap != source_lock->vl.load(std::memory_order_relaxed)))
+    return false;
+  tx.read_set.push_back(source_lock);
+  return true;
+}
+/**
+ * =============================================================================
+ * tm_read: word by word, from the write set if the transaction wrote the word,
+ *          from shared memory otherwise.
+ **/
+inline bool _tm_read(shared_t shared, tx_t _tx, void const *source, size_t size,
+                     void *target) {
+  Region *region = static_cast<Region *>(shared);
+  TX *tx = reinterpret_cast<TX *>(_tx);
+  VA source_va(reinterpret_cast<uint64_t>(source));
+  Segment *segment = region->segments[source_va.segment()];
+  // compute counts
+  size_t align = region->align;
+  size_t word_count = size / align;
+  size_t word_index = source_va.offset() / align;
+  // running pointers
+  const char *__restrict__ _from = segment->data + source_va.offset();
+  char *__restrict__ _to = static_cast<char *>(target);
+  VL *__restrict__ _lock = segment->locks + word_index;
+  for (size_t wi = 0; wi < word_count; ++wi) {
+    if (!read_word(*region, *tx, _lock, _from, _to))
+      return false;
+    // move pointers
+    _from += align;
+    _to += align;
+    _lock++;
+  }
+  return true;
+}
+bool tm_read(shared_t shared, tx_t _tx, void const *source, size_t size,
+             void *target) noexcept {
+  try {
+    if (likely(_tm_read(shared, _tx, source, size, target)))
+      return true;
+  } catch (...) {
+  }
+  return abort_tx(static_cast<Region *>(shared), reinterpret_cast<TX *>(_tx));
+}
+
+/**
+ * =============================================================================
+ * tm_write: buffer the words in the write set, shared memory is left untouched
+ *           until commit.
+ **/
+inline bool _tm_write(shared_t shared, tx_t _tx, void const *source,
+                      size_t size, void *target) {
+  Region *region = static_cast<Region *>(shared);
+  TX *tx = reinterpret_cast<TX *>(_tx);
+  VA target_va(reinterpret_cast<uint64_t>(target));
+  Segment *segment = region->segments[target_va.segment()];
+  // compute counts
+  size_t align = region->align;
+  size_t word_count = size / align;
+  size_t word_index = target_va.offset() / align;
+  // buffered write
+  size_t buffer_offset = tx->write_buffer.size();
+  tx->write_buffer.resize(buffer_offset + size);
+  char *buffer_ptr = tx->write_buffer.data() + buffer_offset;
+  // running pointers
+  const char *__restrict__ _from = static_cast<const char *>(source);
+  char *__restrict__ _to = segment->data + target_va.offset();
+  VL *__restrict__ _lock = segment->locks + word_index;
+  for (size_t wi = 0; wi < word_count; ++wi) {
+    std::memcpy(buffer_ptr, _from, align);
+    tx->write_set.push_back({_lock, _to, buffer_offset});
+    // move pointers
+    buffer_offset += align;
+    buffer_ptr += align;
+    _from += align;
+    _to += align;
+    _lock++;
+  }
+  return true;
+}
+bool tm_write(shared_t shared, tx_t _tx, void const *source, size_t size,
+              void *target) noexcept {
+  try {
+    return _tm_write(shared, _tx, source, size, target);
+  } catch (...) {
+    return abort_tx(static_cast<Region *>(shared), reinterpret_cast<TX *>(_tx));
+  }
+}
+
+/**
+ * =============================================================================
+ * tm_alloc: add the segment right away, it is removed if the transaction
+ *           aborts.
+ **/
+Alloc tm_alloc(shared_t shared, tx_t _tx, size_t size, void **target) noexcept {
+  Region *region = static_cast<Region *>(shared);
+  TX *tx = reinterpret_cast<TX *>(_tx);
+  try {
+    uint32_t si = region->add_segment(size);
+    tx->allocated_segments.push_back(si);
+    *target = reinterpret_cast<void *>(VA(si, 0).virtual_address());
+    return Alloc::success;
+  } catch (...) {
+    return Alloc::nomem;
+  }
+}
+
+/**
+ * =============================================================================
+ * tm_free: only record the segment, for now it is deleted with the region.
+ **/
+bool tm_free(shared_t shared, tx_t _tx, void *target) noexcept {
+  TX *tx = reinterpret_cast<TX *>(_tx);
+  VA target_va(reinterpret_cast<uint64_t>(target));
+  try {
+    tx->freed_segments.push_back(target_va.segment());
+  } catch (...) {
+    return abort_tx(static_cast<Region *>(shared), tx);
+  }
+  return true;
 }
