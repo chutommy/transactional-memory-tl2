@@ -162,6 +162,36 @@ static void test_read_write() {
 
 /**
  * =============================================================================
+ * Single-threaded: when a transaction writes a word several times, it reads
+ * back and commits the last value written.
+ **/
+static void test_overwrite() {
+  constexpr size_t WORDS = 256, PASSES = 3;
+  shared_t tm = tm_create(WORDS * WORD, WORD);
+  CHECK(tm != invalid_shared);
+  void *start = tm_start(tm);
+
+  size_t stale = 0;
+  atomically(tm, false, [&](Tx &tx) {
+    stale = 0;
+    for (size_t pass = 0; pass < PASSES; ++pass)
+      for (size_t i = 0; i < WORDS; ++i) {
+        tx.set(at(start, i * WORD), pass * WORDS + i);
+        stale += tx.get(at(start, i * WORD)) != word_t(pass * WORDS + i);
+      }
+  });
+  CHECK(stale == 0);
+  atomically(tm, true, [&](Tx &tx) {
+    stale = 0;
+    for (size_t i = 0; i < WORDS; ++i)
+      stale += tx.get(at(start, i * WORD)) != word_t((PASSES - 1) * WORDS + i);
+  });
+  CHECK(stale == 0);
+  tm_destroy(tm);
+}
+
+/**
+ * =============================================================================
  * Single-threaded: regions are independent from each other.
  **/
 static void test_multiple_regions() {
@@ -420,6 +450,7 @@ static void run(const char *name, void (*test)()) {
 
 int main() {
   run("read/write", test_read_write);
+  run("overwrite", test_overwrite);
   run("multiple regions", test_multiple_regions);
   run("many segments", test_many_segments);
   run("counter", test_counter);
