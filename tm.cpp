@@ -435,30 +435,33 @@ bool _tm_end(shared_t shared, tx_t _tx) {
   }
   // increment global version
   uint32_t write_version = region->global_version.fetch_add(1) + 1;
-  // validate read set
-  for (const VL *rl : tx->read_set) {
-    uint32_t snap = rl->vl.load(std::memory_order_acquire);
-    bool locked_by_me = false;
-    if (VL::is_locked(snap)) {
-      // is it in my write set?
-      auto it = std::lower_bound(
-          tx->write_set.begin(), tx->write_set.end(), rl,
-          [](const TX::WriteLog &wl, const VL *val) { return wl.vl < val; });
-      if (it != tx->write_set.end() && it->vl == rl)
-        locked_by_me = true;
-    }
-    if (unlikely((!locked_by_me && VL::is_locked(snap)) ||
-                 VL::version_of(snap) > tx->read_version)) {
-      // vl being modified, or is outdated
-      // release all locks in write set and abort
-      prev_lock = nullptr;
-      for (const TX::WriteLog &wl : tx->write_set) {
-        if (wl.vl == prev_lock)
-          continue;
-        wl.vl->unlock();
-        prev_lock = wl.vl;
+  // no writes can happen between reads and writes (we hold locks)
+  if (tx->read_version + 1 != write_version) {
+    // concurrent writes happened
+    for (const VL *rl : tx->read_set) {
+      uint32_t snap = rl->vl.load(std::memory_order_acquire);
+      bool locked_by_me = false;
+      if (VL::is_locked(snap)) {
+        // is it in my write set?
+        auto it = std::lower_bound(
+            tx->write_set.begin(), tx->write_set.end(), rl,
+            [](const TX::WriteLog &wl, const VL *val) { return wl.vl < val; });
+        if (it != tx->write_set.end() && it->vl == rl)
+          locked_by_me = true;
       }
-      return abort_tx(region, tx);
+      if (unlikely((!locked_by_me && VL::is_locked(snap)) ||
+                   VL::version_of(snap) > tx->read_version)) {
+        // vl being modified, or is outdated
+        // release all locks in write set and abort
+        prev_lock = nullptr;
+        for (const TX::WriteLog &wl : tx->write_set) {
+          if (wl.vl == prev_lock)
+            continue;
+          wl.vl->unlock();
+          prev_lock = wl.vl;
+        }
+        return abort_tx(region, tx);
+      }
     }
   }
   // commit writes
