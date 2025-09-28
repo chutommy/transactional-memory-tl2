@@ -486,13 +486,21 @@ bool tm_end(shared_t shared, tx_t _tx) noexcept {
 
 /**
  * =============================================================================
- * Read of a single word (helper of tm_read).
+ * Read of a single word (helpers of tm_read).
  **/
-// from the write set if the transaction wrote the word, else from shared
-// memory: fails if it is locked, newer than the read version, or modified
-// during the copy (lock sampled before and after).
+// copy a word out of shared memory: fails if it is locked, newer than the read
+// version, or modified during the copy (lock sampled before and after).
 inline bool read_word(Region &region, TX &tx, VL *source_lock, const void *from,
                       void *to) {
+  uint32_t snap = source_lock->vl.load(std::memory_order_acquire);
+  if (unlikely(VL::is_locked(snap) || VL::version_of(snap) > tx.read_version))
+    return false;
+  std::memcpy(to, from, region.align);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  return likely(snap == source_lock->vl.load(std::memory_order_relaxed));
+}
+inline bool read_word_rw(Region &region, TX &tx, VL *source_lock,
+                         const void *from, void *to) {
   if (!tx.write_set.empty()) {
     for (auto it = tx.write_set.rbegin(); it != tx.write_set.rend(); ++it) {
       if (it->addr == from) {
@@ -502,12 +510,7 @@ inline bool read_word(Region &region, TX &tx, VL *source_lock, const void *from,
     }
   }
   // read from shared memory
-  uint32_t snap = source_lock->vl.load(std::memory_order_acquire);
-  if (unlikely(VL::is_locked(snap) || VL::version_of(snap) > tx.read_version))
-    return false;
-  std::memcpy(to, from, region.align);
-  std::atomic_thread_fence(std::memory_order_acquire);
-  if (unlikely(snap != source_lock->vl.load(std::memory_order_relaxed)))
+  if (!read_word(region, tx, source_lock, from, to))
     return false;
   tx.read_set.push_back(source_lock);
   return true;
@@ -531,8 +534,19 @@ inline bool _tm_read(shared_t shared, tx_t _tx, void const *source, size_t size,
   const char *__restrict__ _from = segment->data + source_va.offset();
   char *__restrict__ _to = static_cast<char *>(target);
   VL *__restrict__ _lock = segment->locks + word_index;
+  if (tx->read_only) {
+    for (size_t wi = 0; wi < word_count; ++wi) {
+      if (!read_word(*region, *tx, _lock, _from, _to))
+        return false;
+      // move pointers
+      _from += align;
+      _to += align;
+      _lock++;
+    }
+    return true;
+  }
   for (size_t wi = 0; wi < word_count; ++wi) {
-    if (!read_word(*region, *tx, _lock, _from, _to))
+    if (!read_word_rw(*region, *tx, _lock, _from, _to))
       return false;
     // move pointers
     _from += align;
