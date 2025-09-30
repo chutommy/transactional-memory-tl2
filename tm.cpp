@@ -89,6 +89,61 @@ constexpr std::size_t cache_line_size = 64;
 
 /**
  * =============================================================================
+ * Bloom filter for fast membership test with false positives.
+ * Description: https://en.wikipedia.org/wiki/Bloom_filter
+ *
+ * Inspired by the Murmur3 implementation from:
+ * : https://gist.github.com/kevinmoran/471480b1e20a19b0687d81b75fd801c8
+ * : https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
+ **/
+constexpr size_t BLOOM_BITS = 4096; // 2^12 bits, 512 bytes
+constexpr size_t BLOOM_MASK = BLOOM_BITS - 1;
+constexpr size_t BLOOM_WORD_COUNT = BLOOM_BITS / 64;
+constexpr size_t CACHE_LINE_SHIFT = 2;
+struct alignas(cache_line_size) BloomFilter {
+  uint64_t data[BLOOM_WORD_COUNT];
+
+  BloomFilter() { clear(); }
+
+  static _inline uint32_t fmix(uint32_t h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    return h ^= h >> 16;
+  }
+
+  static _inline void key_bits(const void *ptr, uint32_t &k1, uint32_t &k2) {
+    uint32_t val = reinterpret_cast<uintptr_t>(ptr);
+    val >>= CACHE_LINE_SHIFT; // ignore lower bits within cache line
+    uint32_t h = fmix(val);
+    k1 = h & BLOOM_MASK; // 12 bits per key
+    k2 = (h >> 12) & BLOOM_MASK;
+  }
+
+  _inline void add(const void *addr_ptr) {
+    uint32_t k1, k2;
+    key_bits(addr_ptr, k1, k2);
+    // d[kx / 64] |= (1    << (kx % 64))
+    data[k1 >> 6] |= (1ULL << (k1 & 63));
+    data[k2 >> 6] |= (1ULL << (k2 & 63));
+  }
+
+  _inline bool possibly_contains(const void *addr_ptr) const {
+    uint32_t k1, k2;
+    key_bits(addr_ptr, k1, k2);
+    uint64_t bit1 = (data[k1 >> 6] >> (k1 & 63));
+    uint64_t bit2 = (data[k2 >> 6] >> (k2 & 63));
+    return (bit1 & bit2) & 1;
+  }
+
+  _inline void clear() { std::memset(data, 0, sizeof(data)); }
+};
+
+using BF = BloomFilter;
+
+/**
+ * =============================================================================
  * Versioned lock with atomic uint32_t.
  * Version is stored in the upper 31 bits, lock bit in the lowest bit.
  * Lock is acquired by setting the lowest bit to 1 using CAS.
@@ -278,10 +333,10 @@ struct Region {
 /**
  * =============================================================================
  * Transaction context.
- * Contains read set, write set, write buffer, versions.
- * Memory layout:  +---------------+--------------+--
- *                 | read only bit : read version | ...
- *                 +---------------+--------------+--
+ * Contains read set, write set, write buffer, bloom filter, versions.
+ * Memory layout:  +---------------+--------------+--------------------+--
+ *                 | read only bit : read version | write bloom filter | ...
+ *                 +---------------+--------------+--------------------+--
  *               --+---------------+--------------+--------------------+--
  *             ... | read set      , write set    , write buffer       | ...
  *               --+---------------+--------------+--------------------+--
@@ -292,6 +347,7 @@ struct Region {
  * WriteLog: contains the versioned lock, target address, and offset in wbuffer.
  * Write buffer: contiguous buffer for all write data.
  * Allocated / freed segments: list of segment ids allocated / freed in tx.
+ * Bloom filter: for fast membership test in write set.
  **/
 struct Transaction {
   using ReadLog = VL *;
@@ -303,6 +359,7 @@ struct Transaction {
 
   alignas(cache_line_size) bool read_only;
   uint32_t read_version;
+  BF write_bloom;
   std::vector<ReadLog> read_set;
   std::vector<WriteLog> write_set;
   std::vector<char> write_buffer;
@@ -322,6 +379,7 @@ struct Transaction {
   void reset(bool is_ro, uint32_t rv) {
     read_only = is_ro;
     read_version = rv;
+    write_bloom.clear();
     read_set.clear();
     write_set.clear();
     write_buffer.clear();
@@ -501,7 +559,7 @@ inline bool read_word(Region &region, TX &tx, VL *source_lock, const void *from,
 }
 inline bool read_word_rw(Region &region, TX &tx, VL *source_lock,
                          const void *from, void *to) {
-  if (!tx.write_set.empty()) {
+  if (!tx.write_set.empty() && tx.write_bloom.possibly_contains(from)) {
     for (auto it = tx.write_set.rbegin(); it != tx.write_set.rend(); ++it) {
       if (it->addr == from) {
         std::memcpy(to, tx.write_buffer.data() + it->offset, region.align);
@@ -589,6 +647,7 @@ inline bool _tm_write(shared_t shared, tx_t _tx, void const *source,
   char *__restrict__ _to = segment->data + target_va.offset();
   VL *__restrict__ _lock = segment->locks + word_index;
   for (size_t wi = 0; wi < word_count; ++wi) {
+    tx->write_bloom.add(_to);
     std::memcpy(buffer_ptr, _from, align);
     tx->write_set.push_back({_lock, _to, buffer_offset});
     // move pointers
