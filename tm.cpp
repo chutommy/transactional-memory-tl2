@@ -108,8 +108,8 @@ struct alignas(cache_line_size) BloomFilter {
   static _inline uint32_t fmix(uint32_t h) {
     h ^= h >> 16;
     h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
+    // h ^= h >> 13;
+    // h *= 0xc2b2ae35;
     return h ^= h >> 16;
   }
 
