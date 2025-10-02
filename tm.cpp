@@ -152,8 +152,10 @@ using BF = BloomFilter;
  *                 +-----------------------+
  * Aligned to cache line size to avoid false sharing and invalidating cache
  * lines between different versioned locks.
+ * (disabled to save memory, there is one lock per word)
+   alignas(cache_line_size)
  **/
-struct alignas(cache_line_size) VersionLock {
+struct VersionLock {
   std::atomic_uint32_t vl;
 
   // deleted to prevent accidental heap allocation.

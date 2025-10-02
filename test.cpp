@@ -252,6 +252,39 @@ static void test_many_segments() {
 
 /**
  * =============================================================================
+ * Single-threaded: large segments, either the first of a region or allocated
+ * in a transaction, can be written all over and their memory is given back
+ * (each round would otherwise keep 2 x LARGE bytes).
+ **/
+static void test_large_segments() {
+  constexpr size_t LARGE = 128 << 20, PAGE = 4096, ROUNDS = 4;
+  std::minstd_rand rng(1);
+  for (size_t round = 0; round < ROUNDS; ++round) {
+    shared_t tm = tm_create(LARGE, WORD);
+    CHECK(tm != invalid_shared);
+    void *allocated;
+    atomically(tm, false, [&](Tx &tx) { allocated = tx.alloc(LARGE); });
+
+    for (void *segment : {tm_start(tm), allocated}) {
+      atomically(tm, false, [&](Tx &tx) {
+        for (size_t offset = 0; offset < LARGE; offset += PAGE)
+          tx.set(at(segment, offset), round + offset);
+      });
+      for (size_t i = 0; i < 16; ++i) {
+        size_t offset = (rng() % (LARGE / PAGE)) * PAGE;
+        word_t value;
+        atomically(tm, true,
+                   [&](Tx &tx) { value = tx.get(at(segment, offset)); });
+        CHECK(value == static_cast<word_t>(round + offset));
+      }
+    }
+    atomically(tm, false, [&](Tx &tx) { tx.free(allocated); });
+    tm_destroy(tm);
+  }
+}
+
+/**
+ * =============================================================================
  * Concurrent: every thread repeatedly reads a shared counter in a read-only
  * transaction, then decrements it in a read-write transaction.
  * The counter must never go up between the two (isolation), and must end at
@@ -453,6 +486,7 @@ int main() {
   run("overwrite", test_overwrite);
   run("multiple regions", test_multiple_regions);
   run("many segments", test_many_segments);
+  run("large segments", test_large_segments);
   run("counter", test_counter);
   run("bank", test_bank);
   return 0;
