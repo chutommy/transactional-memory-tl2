@@ -283,9 +283,18 @@ struct Segment {
  * New segments can be added and removed dynamically.
  * Segment (de)allocation is protected by a mutex.
  * Global version is aligned to cache line size to avoid false sharing.
+ *
+ * A freed segment is not deleted right away, as transactions that began before
+ * the free may still be reading it: it is retired, stamped with the global
+ * version, and stays in place until every running transaction has reached that
+ * version (see reclaim).
  **/
 struct Region {
   static constexpr size_t MAX_SEGMENTS = 65535; // 2^16 - 1 segments
+  struct Retired {
+    uint32_t segment;
+    uint32_t version;
+  };
 
   // accessed frequently, align to cache line size
   alignas(cache_line_size) std::atomic_uint32_t global_version;
@@ -293,6 +302,7 @@ struct Region {
   const size_t size;
   Segment *segments[MAX_SEGMENTS];
   std::mutex alloc_mtx;
+  std::vector<Retired> retired;
 
   Region(size_t size, size_t align) : align(align), size(size) {
     std::memset(segments, 0, sizeof(segments));
@@ -313,6 +323,7 @@ struct Region {
   // create a new segment of given size, return the segment id.
   _inline uint32_t add_segment(size_t size) {
     std::lock_guard<std::mutex> lock(alloc_mtx);
+    reclaim(); // make room first
     // find a free slot
     for (uint32_t current = 0; current < MAX_SEGMENTS; ++current) {
       if (segments[current] == nullptr) {
@@ -324,12 +335,25 @@ struct Region {
     throw std::bad_alloc();
   }
 
-  // delete a segment.
+  // delete a segment right away, only safe if no other transaction knows it.
   _inline void remove_segment(uint32_t si) {
     std::lock_guard<std::mutex> lock(alloc_mtx);
     delete segments[si];
     segments[si] = nullptr;
   }
+
+  // retire the segments freed by a transaction that just committed.
+  _inline void retire_segments(const std::vector<uint32_t> &freed) {
+    std::lock_guard<std::mutex> lock(alloc_mtx);
+    uint32_t version = global_version.load();
+    for (uint32_t si : freed)
+      retired.push_back({si, version});
+    reclaim();
+  }
+
+  // delete the retired segments that no running transaction can still reach.
+  // must be called with alloc_mtx held (defined below, needs Transaction).
+  inline void reclaim();
 };
 
 /**
@@ -350,8 +374,16 @@ struct Region {
  * Write buffer: contiguous buffer for all write data.
  * Allocated / freed segments: list of segment ids allocated / freed in tx.
  * Bloom filter: for fast membership test in write set.
+ *
+ * For memory reclamation, each context also publishes to the other threads the
+ * region it runs a transaction on and since which version ('IDLE' if none),
+ * and all the contexts are listed in a registry.
  **/
 struct Transaction {
+  static constexpr uint32_t IDLE = UINT32_MAX;
+  static inline std::mutex registry_mtx;
+  static inline std::vector<Transaction *> registry;
+
   using ReadLog = VL *;
   struct WriteLog {
     VL *vl;
@@ -361,6 +393,8 @@ struct Transaction {
 
   alignas(cache_line_size) bool read_only;
   uint32_t read_version;
+  std::atomic<const Region *> region;
+  std::atomic_uint32_t since;
   BF write_bloom;
   std::vector<ReadLog> read_set;
   std::vector<WriteLog> write_set;
@@ -368,15 +402,22 @@ struct Transaction {
   std::vector<uint32_t> allocated_segments;
   std::vector<uint32_t> freed_segments;
 
-  Transaction() : read_only(false), read_version(0) {
+  Transaction()
+      : read_only(false), read_version(0), region(nullptr), since(IDLE) {
     read_set.reserve(256);
     write_set.reserve(64);
     write_buffer.reserve(1024);
     allocated_segments.reserve(8);
     freed_segments.reserve(8);
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry.push_back(this);
   }
   Transaction(Transaction const &) = delete;
   Transaction &operator=(Transaction const &) = delete;
+  ~Transaction() {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    registry.erase(std::find(registry.begin(), registry.end(), this));
+  }
 
   void reset(bool is_ro, uint32_t rv) {
     read_only = is_ro;
@@ -388,23 +429,62 @@ struct Transaction {
     allocated_segments.clear();
     freed_segments.clear();
   }
+
+  // oldest version since which a transaction runs on the region, IDLE if none.
+  static uint32_t oldest(const Region *region) {
+    std::lock_guard<std::mutex> lock(registry_mtx);
+    uint32_t oldest = IDLE;
+    for (const Transaction *tx : registry)
+      if (tx->region.load() == region)
+        oldest = std::min(oldest, tx->since.load());
+    return oldest;
+  }
 };
 
 using TX = Transaction;
 
 /**
  * =============================================================================
- * End of a transaction.
+ * Memory reclamation.
+ * A segment retired at version v was unreachable for any transaction reading
+ * the memory as of version v or later: it can be deleted, and its slot reused,
+ * once every transaction running on the region began at version v or later.
+ **/
+inline void Region::reclaim() {
+  if (retired.empty())
+    return;
+  uint32_t oldest = TX::oldest(this);
+  auto kept = retired.begin();
+  for (const Retired &r : retired) {
+    if (r.version <= oldest) {
+      delete segments[r.segment];
+      segments[r.segment] = nullptr;
+    } else {
+      *kept++ = r;
+    }
+  }
+  retired.erase(kept, retired.end());
+}
+
+/**
+ * =============================================================================
+ * End of a transaction, the context stops pinning retired segments.
  **/
 // abort: the segments it allocated were never visible to other transactions.
 static bool abort_tx(Region *region, TX *tx) {
   for (uint32_t si : tx->allocated_segments)
     region->remove_segment(si);
   tx->allocated_segments.clear();
+  tx->since.store(TX::IDLE, std::memory_order_release);
   return false;
 }
-// commit: for now, the segments it freed are only deleted with the region.
-static bool commit_tx(Region *unused(region), TX *unused(tx)) { return true; }
+// commit: the segments it freed may still be read by older transactions.
+static bool commit_tx(Region *region, TX *tx) {
+  tx->since.store(TX::IDLE, std::memory_order_release);
+  if (!tx->freed_segments.empty())
+    region->retire_segments(tx->freed_segments);
+  return true;
+}
 
 /**
  * =============================================================================
@@ -421,7 +501,7 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 
 /**
  * =============================================================================
- * tm_destroy: delete the region and all its segments.
+ * tm_destroy: delete the region and all its segments, retired ones included.
  **/
 void tm_destroy(shared_t shared) noexcept {
   delete static_cast<Region *>(shared);
@@ -459,6 +539,11 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
   Region *region = static_cast<Region *>(shared);
   static thread_local TX tx; // no nested transactions
   try {
+    // publish that a transaction runs here *before* sampling its read version
+    // (both sequentially consistent): a concurrent reclaim either sees this
+    // transaction, or retired its segments at a version <= the read version.
+    tx.region.store(region);
+    tx.since.store(region->global_version.load());
     uint32_t rv = region->global_version.load();
     tx.reset(is_ro, rv);
     return reinterpret_cast<tx_t>(&tx);
@@ -690,7 +775,7 @@ Alloc tm_alloc(shared_t shared, tx_t _tx, size_t size, void **target) noexcept {
 
 /**
  * =============================================================================
- * tm_free: only record the segment, for now it is deleted with the region.
+ * tm_free: only record the segment, it is retired when the transaction commits.
  **/
 bool tm_free(shared_t shared, tx_t _tx, void *target) noexcept {
   TX *tx = reinterpret_cast<TX *>(_tx);

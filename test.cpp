@@ -318,6 +318,60 @@ static void test_counter() {
 
 /**
  * =============================================================================
+ * Concurrent: a shared word points to a segment, whose words all hold the
+ * number of times it was replaced. Threads either read the whole segment in a
+ * read-only transaction, or replace it by a new one and free it.
+ * A reader must never see a segment half written or already freed, no
+ * replacement can be lost, and freed segments must be recycled as there are
+ * more replacements than a region can hold segments.
+ **/
+static void test_swap() {
+  constexpr size_t WORDS = 16, ROUNDS = 200000;
+  const size_t threads = thread_count();
+  shared_t tm = tm_create(WORD, WORD);
+  CHECK(tm != invalid_shared);
+  void *head = tm_start(tm);
+  std::atomic<word_t> swaps{0};
+
+  parallel(threads, [&](size_t index) {
+    std::minstd_rand rng(index + 1);
+    for (size_t round = 0; round < ROUNDS / threads; ++round) {
+      if (rng() % 2) {
+        atomically(tm, false, [&](Tx &tx) {
+          void *current = reinterpret_cast<void *>(tx.get(head));
+          void *segment = tx.alloc(WORDS * WORD);
+          word_t count = current ? tx.get(current) + 1 : 1;
+          for (size_t i = 0; i < WORDS; ++i)
+            tx.set(at(segment, i * WORD), count);
+          tx.set(head, reinterpret_cast<word_t>(segment));
+          if (current)
+            tx.free(current);
+        });
+        swaps.fetch_add(1);
+      } else {
+        bool same = true;
+        atomically(tm, true, [&](Tx &tx) {
+          void *current = reinterpret_cast<void *>(tx.get(head));
+          word_t count = current ? tx.get(current) : 0;
+          same = true;
+          for (size_t i = 1; current && i < WORDS; ++i)
+            same &= tx.get(at(current, i * WORD)) == count;
+        });
+        CHECK(same);
+      }
+    }
+  });
+
+  word_t count;
+  atomically(tm, true, [&](Tx &tx) {
+    count = tx.get(reinterpret_cast<void *>(tx.get(head)));
+  });
+  CHECK(count == swaps.load());
+  tm_destroy(tm);
+}
+
+/**
+ * =============================================================================
  * Concurrent: a bank, whose accounts live in a linked list of segments.
  * Segment layout:  +-------+------+--------+-----------+-----+-----------+
  *                  | count | next | parity | balance 0 | ... | balance N |
@@ -488,6 +542,7 @@ int main() {
   run("many segments", test_many_segments);
   run("large segments", test_large_segments);
   run("counter", test_counter);
+  run("swap", test_swap);
   run("bank", test_bank);
   return 0;
 }
