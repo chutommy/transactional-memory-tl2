@@ -276,9 +276,9 @@ struct Segment {
  * Memory layout:  +--------------------+------------+--
  *                 | 32bit glob_version : padding    | ...
  *                 +--------------------+------------+--
- *                       --+-------+------+----------+-------+
- *                     ... | align , size | segments , mutex |
- *                       --+-------+------+----------+-------+
+ *                       --+-------+------+----------+-------+---------+
+ *                     ... | align , size | segments , mutex , next id |
+ *                       --+-------+------+----------+-------+---------+
  * Max 65535 segments (16 bits segment index in VA, offset by 1).
  * New segments can be added and removed dynamically.
  * Segment (de)allocation is protected by a mutex.
@@ -302,6 +302,7 @@ struct Region {
   const size_t size;
   Segment *segments[MAX_SEGMENTS];
   std::mutex alloc_mtx;
+  uint32_t alloc_next = 0;
   std::vector<Retired> retired;
 
   Region(size_t size, size_t align) : align(align), size(size) {
@@ -324,13 +325,18 @@ struct Region {
   _inline uint32_t add_segment(size_t size) {
     std::lock_guard<std::mutex> lock(alloc_mtx);
     reclaim(); // make room first
+    uint32_t start = alloc_next;
+    uint32_t current = start;
     // find a free slot
-    for (uint32_t current = 0; current < MAX_SEGMENTS; ++current) {
+    // continue from last position (round robin)
+    do {
       if (segments[current] == nullptr) {
         segments[current] = new Segment(size, align);
+        alloc_next = (current + 1) % MAX_SEGMENTS;
         return current;
       }
-    }
+      current = (current + 1) % MAX_SEGMENTS;
+    } while (current != start);
     // no free slot
     throw std::bad_alloc();
   }

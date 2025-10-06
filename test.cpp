@@ -223,10 +223,11 @@ static void test_multiple_regions() {
 /**
  * =============================================================================
  * Single-threaded: many segments can be allocated, start zeroed, are
- * independent from each other and can be freed.
+ * independent from each other and can be freed. Freed segments are recycled:
+ * a region cannot hold RECYCLED segments at once.
  **/
 static void test_many_segments() {
-  constexpr size_t SEGMENTS = 1024;
+  constexpr size_t SEGMENTS = 1024, RECYCLED = 100000;
   shared_t tm = tm_create(WORD, WORD);
   CHECK(tm != invalid_shared);
   std::vector<void *> segments(SEGMENTS);
@@ -247,6 +248,12 @@ static void test_many_segments() {
   }
   for (size_t i = 0; i < SEGMENTS; ++i)
     atomically(tm, false, [&](Tx &tx) { tx.free(segments[i]); });
+
+  for (size_t i = 0; i < RECYCLED; ++i) {
+    void *segment;
+    atomically(tm, false, [&](Tx &tx) { segment = tx.alloc(WORD); });
+    atomically(tm, false, [&](Tx &tx) { tx.free(segment); });
+  }
   tm_destroy(tm);
 }
 
