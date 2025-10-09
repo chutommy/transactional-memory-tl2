@@ -30,9 +30,12 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
 
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 
 /**
  * =============================================================================
@@ -77,7 +80,13 @@
 
 /** CPU instruction for spin-wait loops.
  **/
-static _inline void spinwait() { _mm_pause(); }
+static _inline void spinwait() {
+#if defined(__x86_64__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
 
 /** Determine cache line size for alignment.
 #ifdef __cpp_lib_hardware_interference_size
