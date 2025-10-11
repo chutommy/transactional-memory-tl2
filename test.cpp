@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -538,8 +539,14 @@ static void test_bank() {
 static void run(const char *name, void (*test)()) {
   std::printf("%-20s ", name);
   std::fflush(stdout);
+  auto start = std::chrono::steady_clock::now();
   test();
-  std::printf("ok\n");
+  auto stop = std::chrono::steady_clock::now();
+  std::printf(
+      "ok (%lld ms)\n",
+      static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(stop - start)
+              .count()));
 }
 
 int main() {
