@@ -51,3 +51,12 @@ Requires a C++17 compiler and `make`. Developed for x86-64 Linux, also builds on
 ## How it works
 
 See <https://chutommy.com/projects/transactional-memory-tl2/>.
+
+## References
+
+This project originally started as part of the Concurrent Computing course taught by Rachid Guerraoui at EPFL.
+
+1. D. Dice, O. Shalev, N. Shavit. *Transactional Locking II*. DISC 2006.\
+   <https://doi.org/10.1007/11864219_14>
+2. R. Guerraoui, M. Kapałka. *Principles of Transactional Memory*. 2010.\
+   <https://doi.org/10.1007/978-3-031-02002-5>
